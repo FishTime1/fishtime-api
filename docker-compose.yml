@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fishtime
+      POSTGRES_PASSWORD: fishtime_pass
+      POSTGRES_DB: fishtime_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - fishtime_pg:/var/lib/postgresql/data
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fishtime:fishtime_pass@db:5432/fishtime_db
+      JWT_SECRET: "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+      ADMIN_KEY: "CHANGE_THIS_ADMIN_KEY"
+      DEVICE_LIMIT: "3"
+      TOKEN_EXPIRE_MINUTES: "1440"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  fishtime_pg:
