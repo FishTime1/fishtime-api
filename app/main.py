@@ -1,6 +1,6 @@
 import datetime as dt
 import secrets
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
@@ -14,13 +14,17 @@ from .settings import settings
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="FishTime API", version="1.0")
+app = FastAPI(title="FishTime API", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.fishtime.online",
         "https://fishtime.online",
+        "http://www.fishtime.online",
+        "http://fishtime.online",
+        "https://fishtime-api.onrender.com",
+        "https://api.fishtime.online",
         "https://FishTime1.github.io",
         "https://fishTime1.github.io",
         "http://localhost:5500",
@@ -94,6 +98,13 @@ def remaining_info(expires_at: dt.datetime):
         "ok": remaining > 0,
     }
 
+def admin_get_user_by_email(db: Session, email: str):
+    email = email.lower().strip()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    return user
+
 class RegisterReq(BaseModel):
     email: EmailStr
     password: str
@@ -112,6 +123,22 @@ class AdminCodeReq(BaseModel):
 
 class ChangePasswordReq(BaseModel):
     current_password: str
+    new_password: str
+
+class AdminAddTimeReq(BaseModel):
+    email: EmailStr
+    days: int = 0
+    hours: int = 0
+    minutes: int = 0
+
+class AdminDeleteUserReq(BaseModel):
+    email: EmailStr
+
+class AdminResetDevicesReq(BaseModel):
+    email: EmailStr
+
+class AdminResetPasswordReq(BaseModel):
+    email: EmailStr
     new_password: str
 
 PLAN_SECONDS = {
@@ -230,6 +257,193 @@ def change_password(
     db.commit()
     return {"ok": True, "message": "password_changed"}
 
+# ---------------------------
+# ADMIN: DASHBOARD / USERS
+# ---------------------------
+
+@app.get("/v1/admin/stats")
+def admin_stats(
+    x_admin_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    total_users = db.execute(select(func.count(User.id))).scalar_one()
+    total_codes = db.execute(select(func.count(ActivationCode.code))).scalar_one()
+    used_codes = db.execute(
+        select(func.count(ActivationCode.code)).where(ActivationCode.is_used == True)
+    ).scalar_one()
+
+    now = utcnow()
+
+    subs = db.execute(select(Subscription)).scalars().all()
+    active_users = 0
+    expired_users = 0
+
+    for sub in subs:
+        if sub.expires_at and sub.expires_at > now:
+            active_users += 1
+        else:
+            expired_users += 1
+
+    return {
+        "total_users": total_users,
+        "active_users": active_users,
+        "expired_users": expired_users,
+        "total_codes": total_codes,
+        "used_codes": used_codes,
+    }
+
+@app.get("/v1/admin/users")
+def admin_list_users(
+    x_admin_key: str | None = Header(default=None),
+    q: str = Query(default=""),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    stmt = select(User).order_by(User.id.desc())
+    if q.strip():
+        stmt = select(User).where(User.email.ilike(f"%{q.strip().lower()}%")).order_by(User.id.desc())
+
+    users = db.execute(stmt).scalars().all()
+    results = []
+
+    for user in users:
+        sub = get_subscription(db, user)
+        info = remaining_info(sub.expires_at)
+
+        device_count = db.execute(
+            select(func.count(Device.id)).where(Device.user_id == user.id)
+        ).scalar_one()
+
+        results.append({
+            "id": user.id,
+            "email": user.email,
+            "device_count": device_count,
+            "device_limit": settings.DEVICE_LIMIT,
+            **info,
+        })
+
+    db.commit()
+    return results
+
+@app.post("/v1/admin/users/add-time")
+def admin_add_time(
+    req: AdminAddTimeReq,
+    x_admin_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    if req.days == 0 and req.hours == 0 and req.minutes == 0:
+        raise HTTPException(status_code=400, detail="time_required")
+
+    user = admin_get_user_by_email(db, req.email)
+    sub = get_subscription(db, user)
+
+    now = utcnow()
+    base = sub.expires_at if sub.expires_at > now else now
+    sub.expires_at = base + dt.timedelta(days=req.days, hours=req.hours, minutes=req.minutes)
+
+    db.commit()
+    return {
+        "ok": True,
+        "email": user.email,
+        **remaining_info(sub.expires_at)
+    }
+
+@app.post("/v1/admin/users/reset-devices")
+def admin_reset_devices(
+    req: AdminResetDevicesReq,
+    x_admin_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    user = admin_get_user_by_email(db, req.email)
+
+    devices = db.execute(
+        select(Device).where(Device.user_id == user.id)
+    ).scalars().all()
+
+    removed = 0
+    for d in devices:
+        db.delete(d)
+        removed += 1
+
+    db.commit()
+    return {
+        "ok": True,
+        "email": user.email,
+        "removed_devices": removed,
+    }
+
+@app.post("/v1/admin/users/reset-password")
+def admin_reset_password(
+    req: AdminResetPasswordReq,
+    x_admin_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="password_too_short")
+
+    user = admin_get_user_by_email(db, req.email)
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
+
+    return {
+        "ok": True,
+        "email": user.email,
+        "message": "password_reset"
+    }
+
+@app.post("/v1/admin/users/delete")
+def admin_delete_user(
+    req: AdminDeleteUserReq,
+    x_admin_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    user = admin_get_user_by_email(db, req.email)
+
+    devices = db.execute(
+        select(Device).where(Device.user_id == user.id)
+    ).scalars().all()
+    for d in devices:
+        db.delete(d)
+
+    sub = db.get(Subscription, user.id)
+    if sub:
+        db.delete(sub)
+
+    # Kullanılmış kodları bozmadan kullanıcı referansını temizleyelim
+    used_codes = db.execute(
+        select(ActivationCode).where(ActivationCode.used_by_user_id == user.id)
+    ).scalars().all()
+
+    for code in used_codes:
+        try:
+            code.used_by_user_id = None
+        except Exception:
+            pass
+
+    db.delete(user)
+    db.commit()
+
+    return {
+        "ok": True,
+        "email": req.email.lower().strip(),
+        "message": "user_deleted"
+    }
+
+# ---------------------------
+# ADMIN: CODES
+# ---------------------------
+
 @app.post("/v1/admin/codes")
 def admin_create_code(
     req: AdminCodeReq,
@@ -253,3 +467,26 @@ def admin_create_code(
             return {"code": c, "duration_seconds": duration, "plan": req.plan}
 
     raise HTTPException(status_code=500, detail="code_generation_failed")
+
+@app.get("/v1/admin/codes")
+def admin_list_codes(
+    x_admin_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key)
+
+    codes = db.execute(
+        select(ActivationCode).order_by(ActivationCode.code.desc())
+    ).scalars().all()
+
+    results = []
+    for c in codes:
+        results.append({
+            "code": c.code,
+            "duration_seconds": c.duration_seconds,
+            "is_used": c.is_used,
+            "used_by_user_id": c.used_by_user_id,
+            "used_at": c.used_at.isoformat() if c.used_at else None,
+        })
+
+    return results
