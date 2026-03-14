@@ -1,4 +1,4 @@
-import datetime as dt
+﻿import datetime as dt
 from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean, UniqueConstraint, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
@@ -79,3 +79,14 @@ class SupportMessage(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
     user: Mapped[User] = relationship(back_populates="support_messages")
+
+class SiteSetting(Base):
+    __tablename__ = "site_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
