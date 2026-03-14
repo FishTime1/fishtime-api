@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .db import Base, engine, get_db
 from .models import ActivationCode, Device, Subscription, SupportMessage, User
-from .security import create_token, decode_token, hash_password, verify_password
+from .security import create_admin_token, create_token, decode_token, hash_password, verify_password
 from .settings import settings
 
 
@@ -88,6 +88,11 @@ class AdminResetPasswordReq(BaseModel):
     new_password: str
 
 
+class AdminWebLoginReq(BaseModel):
+    username: str
+    password: str
+
+
 PLAN_SECONDS = {
     "trial_2h": 2 * 3600,
     "day_1": 1 * 86400,
@@ -101,12 +106,24 @@ def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
 
-def require_admin(x_admin_key: str | None):
+def require_admin(x_admin_key: str | None, x_admin_token: str | None = None):
     valid_keys = {ADMIN_KEY_FALLBACK}
     if settings.ADMIN_KEY:
         valid_keys.add(settings.ADMIN_KEY)
-    if not x_admin_key or x_admin_key not in valid_keys:
-        raise HTTPException(status_code=401, detail="admin_unauthorized")
+
+    if x_admin_key and x_admin_key in valid_keys:
+        return {"mode": "key"}
+
+    if x_admin_token:
+        try:
+            payload = decode_token(x_admin_token)
+        except Exception:
+            raise HTTPException(status_code=401, detail="admin_unauthorized")
+
+        if payload.get("role") == "admin" and payload.get("username") == settings.ADMIN_WEB_USERNAME:
+            return payload
+
+    raise HTTPException(status_code=401, detail="admin_unauthorized")
 
 
 def get_current_user(
@@ -202,17 +219,32 @@ def serialize_support_message(message: SupportMessage):
     }
 
 
+def serialize_device(device: Device):
+    return {
+        "id": device.id,
+        "device_id": device.device_id,
+        "first_seen": device.first_seen.isoformat() if device.first_seen else None,
+        "last_seen": device.last_seen.isoformat() if device.last_seen else None,
+    }
+
+
 def build_user_summary(db: Session, user: User):
     sub = db.get(Subscription, user.id)
     expires_at = sub.expires_at if sub else utcnow()
-    device_count = db.execute(
-        select(func.count(Device.id)).where(Device.user_id == user.id)
-    ).scalar_one()
+    devices = db.execute(
+        select(Device)
+        .where(Device.user_id == user.id)
+        .order_by(Device.last_seen.desc(), Device.id.desc())
+    ).scalars().all()
+    last_seen = devices[0].last_seen if devices else None
     return {
         "id": user.id,
         "email": user.email,
-        "device_count": device_count,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "device_count": len(devices),
         "device_limit": settings.DEVICE_LIMIT,
+        "devices": [serialize_device(device) for device in devices],
+        "last_device_seen_at": last_seen.isoformat() if last_seen else None,
         **remaining_info(expires_at),
     }
 
@@ -363,12 +395,69 @@ def send_my_message(
     return {"ok": True, "message": serialize_support_message(message)}
 
 
+@app.delete("/v1/admin/messages/item/{message_id}")
+def admin_delete_message(
+    message_id: int,
+    x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key, x_admin_token)
+
+    message = db.get(SupportMessage, message_id)
+    if not message:
+        raise HTTPException(status_code=404, detail="message_not_found")
+
+    db.delete(message)
+    db.commit()
+    return {"ok": True, "message_id": message_id}
+
+
+@app.delete("/v1/admin/messages/thread/{user_id}")
+def admin_delete_message_thread(
+    user_id: int,
+    x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key, x_admin_token)
+
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="user_not_found")
+
+    messages = db.execute(
+        select(SupportMessage).where(SupportMessage.user_id == user_id)
+    ).scalars().all()
+    removed_count = len(messages)
+    for message in messages:
+        db.delete(message)
+    db.commit()
+    return {"ok": True, "user_id": user_id, "removed_count": removed_count}
+
+
+@app.post("/v1/admin/web-login")
+def admin_web_login(req: AdminWebLoginReq):
+    username = req.username.strip()
+    password = req.password
+
+    if username != settings.ADMIN_WEB_USERNAME or password != settings.ADMIN_WEB_PASSWORD:
+        raise HTTPException(status_code=401, detail="invalid_admin_credentials")
+
+    return {
+        "ok": True,
+        "username": settings.ADMIN_WEB_USERNAME,
+        "token": create_admin_token(settings.ADMIN_WEB_USERNAME),
+    }
+
+
 @app.get("/v1/admin/stats")
 def admin_stats(
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     now = utcnow()
     total_users = db.execute(select(func.count(User.id))).scalar_one()
@@ -400,9 +489,10 @@ def admin_stats(
 def admin_users(
     q: str = Query(default=""),
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     stmt = select(User).order_by(User.created_at.desc())
     if q.strip():
@@ -417,9 +507,10 @@ def admin_users(
 def admin_add_time(
     req: AdminAddTimeReq,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     total_seconds = (req.days * 86400) + (req.hours * 3600) + (req.minutes * 60)
     if total_seconds <= 0:
@@ -439,9 +530,10 @@ def admin_add_time(
 def admin_reset_devices(
     req: AdminUserActionReq,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     user = get_user_by_email(db, str(req.email))
     devices = db.execute(select(Device).where(Device.user_id == user.id)).scalars().all()
@@ -456,9 +548,10 @@ def admin_reset_devices(
 def admin_reset_password(
     req: AdminResetPasswordReq,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     if len(req.new_password.strip()) < 6:
         raise HTTPException(status_code=400, detail="password_too_short")
@@ -473,9 +566,10 @@ def admin_reset_password(
 def admin_delete_user(
     req: AdminUserActionReq,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     user = get_user_by_email(db, str(req.email))
     used_codes = db.execute(
@@ -493,9 +587,10 @@ def admin_delete_user(
 @app.get("/v1/admin/codes")
 def admin_list_codes(
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     codes = db.execute(
         select(ActivationCode).order_by(ActivationCode.created_at.desc(), ActivationCode.id.desc())
@@ -507,9 +602,10 @@ def admin_list_codes(
 def admin_create_code(
     req: AdminCodeReq,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     if req.plan not in PLAN_SECONDS:
         raise HTTPException(status_code=400, detail="invalid_plan")
@@ -536,12 +632,32 @@ def admin_create_code(
     raise HTTPException(status_code=500, detail="code_generation_failed")
 
 
+@app.delete("/v1/admin/codes/{code_id}")
+def admin_delete_code(
+    code_id: int,
+    x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key, x_admin_token)
+
+    code = db.get(ActivationCode, code_id)
+    if not code:
+        raise HTTPException(status_code=404, detail="code_not_found")
+
+    code_value = code.code
+    db.delete(code)
+    db.commit()
+    return {"ok": True, "id": code_id, "code": code_value}
+
+
 @app.get("/v1/admin/messages")
 def admin_list_messages(
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     users = db.execute(select(User).order_by(User.created_at.desc())).scalars().all()
     conversations = []
@@ -579,9 +695,10 @@ def admin_list_messages(
 def admin_get_message_thread(
     user_id: int,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     user = db.get(User, user_id)
     if not user:
@@ -613,9 +730,10 @@ def admin_send_message(
     user_id: int,
     req: SupportMessageReq,
     x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    require_admin(x_admin_key)
+    require_admin(x_admin_key, x_admin_token)
 
     user = db.get(User, user_id)
     if not user:
