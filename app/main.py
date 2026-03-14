@@ -1,4 +1,4 @@
-import datetime as dt
+﻿import datetime as dt
 import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .db import Base, engine, get_db
-from .models import ActivationCode, Device, Subscription, SupportMessage, User
+from .models import ActivationCode, Device, SiteSetting, Subscription, SupportMessage, User
 from .security import create_admin_token, create_token, decode_token, hash_password, verify_password
 from .settings import settings
 
@@ -93,6 +93,12 @@ class AdminWebLoginReq(BaseModel):
     password: str
 
 
+class AdminSiteVideoReq(BaseModel):
+    raw_url: str
+    watch_url: str
+    embed_url: str
+
+
 PLAN_SECONDS = {
     "trial_2h": 2 * 3600,
     "day_1": 1 * 86400,
@@ -100,6 +106,10 @@ PLAN_SECONDS = {
     "day_15": 15 * 86400,
     "day_30": 30 * 86400,
 }
+
+DEFAULT_SETUP_VIDEO_RAW_URL = "https://www.youtube.com/watch?v=jCRnwHDHFmA&t=225s"
+DEFAULT_SETUP_VIDEO_WATCH_URL = "https://www.youtube.com/watch?v=jCRnwHDHFmA&t=225s"
+DEFAULT_SETUP_VIDEO_EMBED_URL = "https://www.youtube.com/embed/jCRnwHDHFmA?start=225"
 
 
 def utcnow():
@@ -249,9 +259,61 @@ def build_user_summary(db: Session, user: User):
     }
 
 
+def get_site_setting(db: Session, key: str, default: str = "") -> str:
+    setting = db.get(SiteSetting, key)
+    if not setting or setting.value is None:
+        return default
+    return setting.value
+
+
+def set_site_setting(db: Session, key: str, value: str):
+    setting = db.get(SiteSetting, key)
+    if not setting:
+        setting = SiteSetting(key=key, value=value)
+        db.add(setting)
+    else:
+        setting.value = value
+    return setting
+
+
+def get_site_video_config(db: Session):
+    watch_url = get_site_setting(db, "setup_video_watch_url", DEFAULT_SETUP_VIDEO_WATCH_URL)
+    embed_url = get_site_setting(db, "setup_video_embed_url", DEFAULT_SETUP_VIDEO_EMBED_URL)
+    raw_url = get_site_setting(db, "setup_video_raw_url", watch_url or DEFAULT_SETUP_VIDEO_RAW_URL)
+    return {
+        "setup_video_raw_url": raw_url,
+        "setup_video_watch_url": watch_url,
+        "setup_video_embed_url": embed_url,
+    }
+
+
+def validate_site_video_payload(req: AdminSiteVideoReq):
+    raw_url = req.raw_url.strip()
+    watch_url = req.watch_url.strip()
+    embed_url = req.embed_url.strip()
+
+    if not raw_url or not watch_url or not embed_url:
+        raise HTTPException(status_code=400, detail="invalid_setup_video_url")
+
+    if "youtu" not in raw_url.lower() or "youtu" not in watch_url.lower() or "youtube.com/embed/" not in embed_url.lower():
+        raise HTTPException(status_code=400, detail="invalid_setup_video_url")
+
+    return {
+        "setup_video_raw_url": raw_url,
+        "setup_video_watch_url": watch_url,
+        "setup_video_embed_url": embed_url,
+    }
+
 @app.get("/v1/health")
 def health():
     return {"ok": True}
+
+
+
+
+@app.get("/v1/site-config")
+def site_config(db: Session = Depends(get_db)):
+    return get_site_video_config(db)
 
 
 @app.post("/v1/register")
@@ -449,6 +511,33 @@ def admin_web_login(req: AdminWebLoginReq):
         "username": settings.ADMIN_WEB_USERNAME,
         "token": create_admin_token(settings.ADMIN_WEB_USERNAME),
     }
+
+
+
+
+@app.get("/v1/admin/site-config")
+def admin_get_site_config(
+    x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key, x_admin_token)
+    return get_site_video_config(db)
+
+
+@app.post("/v1/admin/site-config")
+def admin_set_site_config(
+    req: AdminSiteVideoReq,
+    x_admin_key: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_admin(x_admin_key, x_admin_token)
+    payload = validate_site_video_payload(req)
+    for key, value in payload.items():
+        set_site_setting(db, key, value)
+    db.commit()
+    return {"ok": True, **payload}
 
 
 @app.get("/v1/admin/stats")
@@ -754,3 +843,15 @@ def admin_send_message(
     db.commit()
     db.refresh(message)
     return {"ok": True, "message": serialize_support_message(message)}
+
+
+
+
+
+
+
+
+
+
+
+
