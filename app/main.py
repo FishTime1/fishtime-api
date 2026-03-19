@@ -93,10 +93,11 @@ class AdminWebLoginReq(BaseModel):
     password: str
 
 
-class AdminSiteVideoReq(BaseModel):
-    raw_url: str
-    watch_url: str
-    embed_url: str
+class AdminSiteConfigReq(BaseModel):
+    raw_url: str | None = None
+    watch_url: str | None = None
+    embed_url: str | None = None
+    public_note: str | None = None
 
 
 PLAN_SECONDS = {
@@ -110,6 +111,7 @@ PLAN_SECONDS = {
 DEFAULT_SETUP_VIDEO_RAW_URL = "https://www.youtube.com/watch?v=jCRnwHDHFmA&t=225s"
 DEFAULT_SETUP_VIDEO_WATCH_URL = "https://www.youtube.com/watch?v=jCRnwHDHFmA&t=225s"
 DEFAULT_SETUP_VIDEO_EMBED_URL = "https://www.youtube.com/embed/jCRnwHDHFmA?start=225"
+DEFAULT_PUBLIC_NOTE = ""
 
 
 def utcnow():
@@ -280,29 +282,45 @@ def get_site_video_config(db: Session):
     watch_url = get_site_setting(db, "setup_video_watch_url", DEFAULT_SETUP_VIDEO_WATCH_URL)
     embed_url = get_site_setting(db, "setup_video_embed_url", DEFAULT_SETUP_VIDEO_EMBED_URL)
     raw_url = get_site_setting(db, "setup_video_raw_url", watch_url or DEFAULT_SETUP_VIDEO_RAW_URL)
+    public_note = get_site_setting(db, "public_note", DEFAULT_PUBLIC_NOTE)
     return {
         "setup_video_raw_url": raw_url,
         "setup_video_watch_url": watch_url,
         "setup_video_embed_url": embed_url,
+        "public_note": public_note,
     }
 
 
-def validate_site_video_payload(req: AdminSiteVideoReq):
-    raw_url = req.raw_url.strip()
-    watch_url = req.watch_url.strip()
-    embed_url = req.embed_url.strip()
+def validate_site_config_payload(req: AdminSiteConfigReq):
+    payload: dict[str, str] = {}
 
-    if not raw_url or not watch_url or not embed_url:
-        raise HTTPException(status_code=400, detail="invalid_setup_video_url")
+    if req.raw_url is not None or req.watch_url is not None or req.embed_url is not None:
+        raw_url = (req.raw_url or "").strip()
+        watch_url = (req.watch_url or "").strip()
+        embed_url = (req.embed_url or "").strip()
 
-    if "youtu" not in raw_url.lower() or "youtu" not in watch_url.lower() or "youtube.com/embed/" not in embed_url.lower():
-        raise HTTPException(status_code=400, detail="invalid_setup_video_url")
+        if not raw_url or not watch_url or not embed_url:
+            raise HTTPException(status_code=400, detail="invalid_setup_video_url")
 
-    return {
-        "setup_video_raw_url": raw_url,
-        "setup_video_watch_url": watch_url,
-        "setup_video_embed_url": embed_url,
-    }
+        if "youtu" not in raw_url.lower() or "youtu" not in watch_url.lower() or "youtube.com/embed/" not in embed_url.lower():
+            raise HTTPException(status_code=400, detail="invalid_setup_video_url")
+
+        payload.update({
+            "setup_video_raw_url": raw_url,
+            "setup_video_watch_url": watch_url,
+            "setup_video_embed_url": embed_url,
+        })
+
+    if req.public_note is not None:
+        note = req.public_note.strip()
+        if len(note) > 4000:
+            raise HTTPException(status_code=400, detail="invalid_public_note")
+        payload["public_note"] = note
+
+    if not payload:
+        raise HTTPException(status_code=400, detail="invalid_site_config_payload")
+
+    return payload
 
 @app.get("/v1/health")
 def health():
@@ -527,17 +545,17 @@ def admin_get_site_config(
 
 @app.post("/v1/admin/site-config")
 def admin_set_site_config(
-    req: AdminSiteVideoReq,
+    req: AdminSiteConfigReq,
     x_admin_key: str | None = Header(default=None),
     x_admin_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
     require_admin(x_admin_key, x_admin_token)
-    payload = validate_site_video_payload(req)
+    payload = validate_site_config_payload(req)
     for key, value in payload.items():
         set_site_setting(db, key, value)
     db.commit()
-    return {"ok": True, **payload}
+    return {"ok": True, **get_site_video_config(db)}
 
 
 @app.get("/v1/admin/stats")
